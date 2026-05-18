@@ -1,0 +1,28 @@
+name: Container Images CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  docker:
+    if: github.repository == 'hanzoai/collab'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: hanzoai/.github/.github/workflows/docker-build.yml@main
+    with:
+      image: ghcr.io/hanzoai/collab
+      platforms: linux/amd64
+      build-args: |
+        VERSION=${{ github.ref_name }}
+        COMMIT_HASH=${{ github.sha }}
+    secrets: inherit
