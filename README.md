@@ -14,7 +14,7 @@ clients (Y.js) ──WS──> collab ──Append──> Store (sqlite | s3)
 |--------|-----------------------|-------|
 | GET    | `/v1/health`          | `{"status":"ok","version":"..."}` |
 | WS     | `/v1/collab/<doc_id>` | Subprotocol `yjs`. Binary frames relayed + persisted. |
-| GET    | `/metrics`            | Prometheus exposition. |
+| GET    | `/v1/metrics`         | Prometheus exposition. |
 
 `doc_id` MUST be `<orgID>:<workspaceID>:<docID>`. The IAM JWT's
 `owner` claim must equal `<orgID>` or the upgrade is rejected with 403.

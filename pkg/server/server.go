@@ -41,11 +41,11 @@ func New(cfg Config) *Server {
 	return &Server{cfg: cfg, registry: room.NewRegistry(cfg.Store)}
 }
 
-// Handler returns the root mux: /v1/health, /v1/collab/:doc_id, /metrics.
+// Handler returns the root mux: /v1/health, /v1/collab/:doc_id, /v1/metrics.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.health)
-	mux.Handle("/metrics", metrics.Handler())
+	mux.Handle("/v1/metrics", metrics.Handler())
 	mux.HandleFunc("/v1/collab/", s.collab)
 	return mux
 }

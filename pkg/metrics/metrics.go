@@ -39,5 +39,5 @@ func Register(reg prometheus.Registerer) {
 	reg.MustRegister(Rooms, Peers, Messages, Errors)
 }
 
-// Handler is the /metrics HTTP handler.
+// Handler is the /v1/metrics HTTP handler.
 func Handler() http.Handler { return promhttp.Handler() }
