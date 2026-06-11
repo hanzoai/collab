@@ -4,40 +4,41 @@ package metrics
 import (
 	"net/http"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	metric "github.com/luxfi/metric"
 )
 
 var (
 	// Rooms is the live count of distinct doc rooms.
-	Rooms = prometheus.NewGauge(prometheus.GaugeOpts{
+	Rooms = metric.NewGauge(metric.GaugeOpts{
 		Name: "collab_rooms",
 		Help: "Number of active collaboration rooms.",
 	})
 	// Peers is the live count of connected WS peers across all rooms.
-	Peers = prometheus.NewGauge(prometheus.GaugeOpts{
+	Peers = metric.NewGauge(metric.GaugeOpts{
 		Name: "collab_peers",
 		Help: "Number of currently connected WebSocket peers.",
 	})
 	// Messages counts relayed binary messages, partitioned by direction.
-	Messages = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Messages = metric.NewCounterVec(metric.CounterOpts{
 		Name: "collab_messages_total",
 		Help: "Total Y.js binary messages handled.",
 	}, []string{"direction"})
 	// Errors counts protocol/auth/storage failures by type.
-	Errors = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Errors = metric.NewCounterVec(metric.CounterOpts{
 		Name: "collab_errors_total",
 		Help: "Errors observed by the collab service.",
 	}, []string{"kind"})
 )
 
 // Register hooks all metrics into the supplied registry, or the default if nil.
-func Register(reg prometheus.Registerer) {
+func Register(reg metric.Registerer) {
 	if reg == nil {
-		reg = prometheus.DefaultRegisterer
+		reg = metric.DefaultRegisterer
 	}
 	reg.MustRegister(Rooms, Peers, Messages, Errors)
 }
 
 // Handler is the /v1/metrics HTTP handler.
-func Handler() http.Handler { return promhttp.Handler() }
+func Handler() http.Handler {
+	return metric.NewHTTPHandler(metric.DefaultGatherer, metric.HandlerOpts{})
+}
