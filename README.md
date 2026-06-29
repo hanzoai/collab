@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="collab" width="880"></p>
+
 # collab
 
 Hanzo realtime collaboration relay. Replaces Huly's `collaborator`
