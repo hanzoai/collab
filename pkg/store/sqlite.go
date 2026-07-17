@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/hanzoai/sqlite"
 )
 
 // SQLite stores each doc as a single row. We do not split updates into
