@@ -26,7 +26,7 @@ clients (Y.js) ──WS──> collab ──Append──> Store (sqlite | s3)
 Bearer JWT in `Authorization: Bearer <token>` OR `?token=<token>`
 (browsers cannot set headers on the WS handshake — secure ONLY over
 TLS). Tokens are verified against the IAM JWKS at `IAM_JWKS_URL`
-(default `https://hanzo.id/.well-known/jwks`).
+(default `https://hanzo.id/v1/iam/.well-known/jwks`).
 
 ## Sync protocol
 
@@ -58,7 +58,7 @@ COLLAB_STORAGE=s3 \
 | `COLLAB_ADDR`        | `:3078` (Huly drop-in port)              |
 | `COLLAB_STORAGE`     | `sqlite`                                 |
 | `COLLAB_SQLITE_PATH` | `collab.db`                              |
-| `IAM_JWKS_URL`       | `https://hanzo.id/.well-known/jwks`      |
+| `IAM_JWKS_URL`       | `https://hanzo.id/v1/iam/.well-known/jwks`      |
 | `S3_ENDPOINT`        | (AWS default if unset)                   |
 | `S3_REGION`          | `us-east-1`                              |
 | `S3_BUCKET`          | required when `COLLAB_STORAGE=s3`        |

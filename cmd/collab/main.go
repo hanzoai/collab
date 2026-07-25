@@ -34,7 +34,7 @@ func main() {
 
 func run() error {
 	addr := envOr("COLLAB_ADDR", ":3078")
-	jwksURL := envOr("IAM_JWKS_URL", "https://hanzo.id/.well-known/jwks")
+	jwksURL := envOr("IAM_JWKS_URL", "https://hanzo.id/v1/iam/.well-known/jwks")
 
 	s, err := newStore()
 	if err != nil {
