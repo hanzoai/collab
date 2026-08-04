@@ -100,3 +100,5 @@ S3 (DO Spaces). Local/dev is SQLite at `collab.db`.
 ├── pkg/store/                # Store interface + sqlite + s3
 └── pkg/metrics/              # Prometheus registry
 ```
+
+Licensed under **MIT OR Apache-2.0**, per [HIP-0137](https://github.com/hanzoai/hips/blob/main/HIPs/hip-0137-one-license.md).
