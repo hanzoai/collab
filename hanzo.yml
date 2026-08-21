@@ -1,0 +1,37 @@
+# Hanzo Collab — the one file that says how this repo builds, gates and ships.
+#
+# The image build was just moved into .hanzo/workflows so the forge would read
+# it; this takes the next step and moves it onto hanzoai/ci's build.yml, which
+# makes the same ghcr push and then copies the tag set to oci.hanzo.ai
+# server-side. ghcr stays as the public mirror — the same arrangement source
+# has, forge canonical and GitHub mirroring it.
+#
+# VERSION is the derived semver now, and that is a repair rather than a
+# translation. The previous caller passed `VERSION=${{ github.ref_name }}`, which
+# on a branch push is the literal string "main" — so a binary built from main
+# reported `main.Version = main`. build.yml substitutes ${VERSION} with the
+# version it publishes, so the binary and its tag finally say the same thing.
+# COMMIT_HASH is dropped because the Dockerfile declares no such ARG; it was
+# being passed and ignored. Provenance is stamped by the reusable anyway.
+#
+# The version is derived, never typed: this repo declares none, so imgver reads
+# the registry floor. Note the floor is AHEAD of production — ghcr has 0.2.0
+# while collab/collab runs 0.1.1 — so builds have been landing that nothing
+# deploys. Moving that pin is its own decision.
+
+test:
+  - name: build-and-vet
+    run: |
+      set -e
+      go build ./...
+      go vet ./...
+
+images:
+  - name: collab
+    context: .
+    dockerfile: Dockerfile
+    repo: ghcr.io/hanzoai/collab
+    platforms:
+      - linux/amd64
+    args:
+      VERSION: "${VERSION}"
