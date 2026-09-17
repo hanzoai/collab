@@ -91,8 +91,7 @@ func (s *S3) Load(ctx context.Context, docID string) ([]byte, error) {
 		Key:    aws.String(s.key(docID)),
 	})
 	if err != nil {
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
+		if _, ok := errors.AsType[*types.NoSuchKey](err); ok {
 			return nil, nil
 		}
 		return nil, err
