@@ -2,6 +2,8 @@ package room
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -123,4 +125,72 @@ func TestRoomBroadcast(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("persistence never observed")
+}
+
+// failStore refuses every Load.
+type failStore struct{ memStore }
+
+func (*failStore) Load(context.Context, string) ([]byte, error) { return nil, errors.New("store down") }
+
+// A Join whose Load fails must leave the registry as it found it; otherwise
+// every failed join of a new doc id holds a Room forever.
+func TestJoinFailedLoadLeavesNoRoom(t *testing.T) {
+	r := NewRegistry(&failStore{})
+	for i := range 100 {
+		p := &Peer{ID: "a", Send: make(chan []byte, 1)}
+		if _, _, err := r.Join(context.Background(), fmt.Sprintf("hanzo:w:%d", i), p); err == nil {
+			t.Fatal("join succeeded on a failing store")
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n := len(r.rooms); n != 0 {
+		t.Fatalf("%d rooms left behind by failed joins", n)
+	}
+}
+
+// gatedStore holds each Load until release is closed.
+type gatedStore struct {
+	memStore
+	loading chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedStore) Load(ctx context.Context, id string) ([]byte, error) {
+	g.loading <- struct{}{}
+	<-g.release
+	return g.memStore.Load(ctx, id)
+}
+
+// The last peer leaving while another peer's Join is still loading must not
+// strand the joiner in a Room the registry has dropped, where it would never
+// meet the peers who join after it.
+func TestJoinDuringLastLeaveEntersRegisteredRoom(t *testing.T) {
+	gs := &gatedStore{memStore: *newMem(), loading: make(chan struct{}), release: make(chan struct{})}
+	r := NewRegistry(gs)
+
+	first := &Peer{ID: "a", Send: make(chan []byte, 1)}
+	go func() { <-gs.loading; gs.release <- struct{}{} }()
+	if _, _, err := r.Join(context.Background(), "doc", first); err != nil {
+		t.Fatal(err)
+	}
+
+	joined := make(chan *Room)
+	go func() {
+		rm, _, err := r.Join(context.Background(), "doc", &Peer{ID: "b", Send: make(chan []byte, 1)})
+		if err != nil {
+			t.Error(err)
+		}
+		joined <- rm
+	}()
+	<-gs.loading
+	r.Leave("doc", first)
+	close(gs.release)
+	rm := <-joined
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rooms["doc"] != rm {
+		t.Fatal("joiner is in a room the registry no longer holds")
+	}
 }

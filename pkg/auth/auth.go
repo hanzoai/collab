@@ -42,15 +42,24 @@ type Verifier struct {
 	keys    map[string]*rsa.PublicKey
 	fetched time.Time
 	ttl     time.Duration
+
+	// A token whose kid the cached set lacks forces a fetch, and anyone can
+	// send one, so fetches are spaced at least minRefresh apart: a caller
+	// inside the window gets the last fetch's outcome instead of a new fetch.
+	refreshMu  sync.Mutex
+	attempted  time.Time
+	lastErr    error
+	minRefresh time.Duration
 }
 
 // New constructs a Verifier against the IAM JWKS URL.
 func New(jwksURL string) *Verifier {
 	return &Verifier{
-		jwksURL: jwksURL,
-		client:  &http.Client{Timeout: 10 * time.Second},
-		keys:    map[string]*rsa.PublicKey{},
-		ttl:     10 * time.Minute,
+		jwksURL:    jwksURL,
+		client:     &http.Client{Timeout: 10 * time.Second},
+		keys:       map[string]*rsa.PublicKey{},
+		ttl:        10 * time.Minute,
+		minRefresh: 30 * time.Second,
 	}
 }
 
@@ -116,7 +125,22 @@ type jwks struct {
 	Keys []jwk `json:"keys"`
 }
 
+// refresh fetches the JWKS at most once per minRefresh and returns that
+// fetch's result to every caller inside the window. The fetch ignores the
+// caller's cancellation, so one aborted handshake cannot record a failure
+// for everyone; the client timeout still bounds it.
 func (v *Verifier) refresh(ctx context.Context) error {
+	v.refreshMu.Lock()
+	defer v.refreshMu.Unlock()
+	if time.Since(v.attempted) < v.minRefresh {
+		return v.lastErr
+	}
+	v.attempted = time.Now()
+	v.lastErr = v.fetch(context.WithoutCancel(ctx))
+	return v.lastErr
+}
+
+func (v *Verifier) fetch(ctx context.Context) error {
 	u, err := url.Parse(v.jwksURL)
 	if err != nil {
 		return err

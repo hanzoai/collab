@@ -49,21 +49,25 @@ func NewRegistry(s store.Store) *Registry {
 
 // Join attaches peer to docID's Room (creating it if needed) and
 // returns the loaded persisted state to replay to the new peer.
+//
+// The state is loaded before the registry is touched, so a failed Load
+// leaves no Room behind. The Room is then found or created and the peer
+// added under one r.mu hold, the same lock Leave takes to remove an empty
+// Room, so a joiner can never enter a Room that Leave has just removed.
 func (r *Registry) Join(ctx context.Context, docID string, peer *Peer) (*Room, []byte, error) {
+	state, err := r.store.Load(ctx, docID)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	rm, ok := r.rooms[docID]
 	if !ok {
 		rm = &Room{DocID: docID, store: r.store, peers: map[*Peer]struct{}{}}
 		r.rooms[docID] = rm
 		metrics.Rooms.Inc()
 	}
-	r.mu.Unlock()
-
-	state, err := r.store.Load(ctx, docID)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	rm.mu.Lock()
 	rm.peers[peer] = struct{}{}
 	rm.mu.Unlock()
