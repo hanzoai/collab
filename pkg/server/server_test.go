@@ -150,25 +150,32 @@ func TestWSRelayBetweenPeers(t *testing.T) {
 	b := dial(t, ctx, ts, "org1:ws1:doc1")
 	defer b.Close(websocket.StatusNormalClosure, "")
 
-	// Give the room registry a tick to register b.
-	time.Sleep(50 * time.Millisecond)
-
+	// A frame is relayed only to peers already joined, so resend until b, whose
+	// join races this write, receives one. Duplicates are harmless: b reads the
+	// first. This keeps the test from flaking when b registers slowly.
 	payload := []byte{0x01, 0x02, 0x03}
-	if err := a.Write(ctx, websocket.MessageBinary, payload); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	readCtx, c := context.WithTimeout(ctx, 2*time.Second)
-	defer c()
-	typ, data, err := b.Read(readCtx)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if typ != websocket.MessageBinary {
-		t.Fatalf("want binary, got %v", typ)
-	}
-	if string(data) != string(payload) {
-		t.Fatalf("relay mismatch: want %v got %v", payload, data)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := a.Write(ctx, websocket.MessageBinary, payload); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		readCtx, c := context.WithTimeout(ctx, 100*time.Millisecond)
+		typ, data, err := b.Read(readCtx)
+		c()
+		if err != nil {
+			if time.Now().Before(deadline) {
+				time.Sleep(100 * time.Millisecond) // stay well under the frame-rate limit
+				continue
+			}
+			t.Fatalf("read: %v", err)
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("want binary, got %v", typ)
+		}
+		if string(data) != string(payload) {
+			t.Fatalf("relay mismatch: want %v got %v", payload, data)
+		}
+		return
 	}
 }
 
