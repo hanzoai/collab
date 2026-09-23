@@ -150,32 +150,42 @@ func TestWSRelayBetweenPeers(t *testing.T) {
 	b := dial(t, ctx, ts, "org1:ws1:doc1")
 	defer b.Close(websocket.StatusNormalClosure, "")
 
-	// A frame is relayed only to peers already joined, so resend until b, whose
-	// join races this write, receives one. Duplicates are harmless: b reads the
-	// first. This keeps the test from flaking when b registers slowly.
+	// A frame is relayed only to peers already joined, so a resends until b,
+	// whose join races the first write, receives one. Duplicates are harmless:
+	// b reads the first. b reads under the test's context, once: a Read whose
+	// context expires closes the connection.
+	type read struct {
+		typ  websocket.MessageType
+		data []byte
+		err  error
+	}
+	got := make(chan read, 1)
+	go func() {
+		typ, data, err := b.Read(ctx)
+		got <- read{typ, data, err}
+	}()
 	payload := []byte{0x01, 0x02, 0x03}
-	deadline := time.Now().Add(5 * time.Second)
+	resend := time.NewTicker(100 * time.Millisecond) // well under the frame-rate limit
+	defer resend.Stop()
 	for {
 		if err := a.Write(ctx, websocket.MessageBinary, payload); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		readCtx, c := context.WithTimeout(ctx, 100*time.Millisecond)
-		typ, data, err := b.Read(readCtx)
-		c()
-		if err != nil {
-			if time.Now().Before(deadline) {
-				time.Sleep(100 * time.Millisecond) // stay well under the frame-rate limit
-				continue
+		select {
+		case <-resend.C:
+			continue
+		case r := <-got:
+			if r.err != nil {
+				t.Fatalf("read: %v", r.err)
 			}
-			t.Fatalf("read: %v", err)
+			if r.typ != websocket.MessageBinary {
+				t.Fatalf("want binary, got %v", r.typ)
+			}
+			if string(r.data) != string(payload) {
+				t.Fatalf("relay mismatch: want %v got %v", payload, r.data)
+			}
+			return
 		}
-		if typ != websocket.MessageBinary {
-			t.Fatalf("want binary, got %v", typ)
-		}
-		if string(data) != string(payload) {
-			t.Fatalf("relay mismatch: want %v got %v", payload, data)
-		}
-		return
 	}
 }
 
