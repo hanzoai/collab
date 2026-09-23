@@ -37,7 +37,7 @@ func (f *fakeVerifier) Verify(_ context.Context, _ string) (*auth.Claims, error)
 
 func newTestServer(t *testing.T, v Verifier) *httptest.Server {
 	t.Helper()
-	s, err := store.NewSQLite(filepath.Join(t.TempDir(), "t.db"))
+	s, err := store.NewSQLite(filepath.Join(t.TempDir(), "t.db"), 1<<20, 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,14 +78,37 @@ func TestUnauthorizedNoToken(t *testing.T) {
 	}
 }
 
-func TestForbiddenWrongOrg(t *testing.T) {
-	ts := newTestServer(t, &fakeVerifier{owner: "other", sub: "u1"})
+// authGet sends a GET carrying a bearer token in the Authorization header.
+func authGet(t *testing.T, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer x")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+// A token in the query string is not a credential: the edge logs it.
+func TestQueryTokenRefused(t *testing.T) {
+	ts := newTestServer(t, &fakeVerifier{owner: "org1", sub: "u1"})
 	defer ts.Close()
 	resp, err := http.Get(ts.URL + "/v1/collab/org1:ws1:doc1?token=x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestForbiddenWrongOrg(t *testing.T) {
+	ts := newTestServer(t, &fakeVerifier{owner: "other", sub: "u1"})
+	defer ts.Close()
+	resp := authGet(t, ts.URL+"/v1/collab/org1:ws1:doc1")
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("want 403, got %d", resp.StatusCode)
 	}
@@ -94,39 +117,37 @@ func TestForbiddenWrongOrg(t *testing.T) {
 func TestBadDocID(t *testing.T) {
 	ts := newTestServer(t, &fakeVerifier{owner: "org1", sub: "u1"})
 	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/v1/collab/notscoped?token=x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
+	resp := authGet(t, ts.URL+"/v1/collab/notscoped")
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", resp.StatusCode)
 	}
+}
+
+// dial opens a WebSocket the way a browser does: the token rides the
+// subprotocol list beside yjs.
+func dial(t *testing.T, ctx context.Context, ts *httptest.Server, doc string) *websocket.Conn {
+	t.Helper()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/collab/" + doc
+	c, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: []string{"yjs", "bearer.x"}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if c.Subprotocol() != "yjs" {
+		t.Fatalf("negotiated %q, want yjs", c.Subprotocol())
+	}
+	return c
 }
 
 func TestWSRelayBetweenPeers(t *testing.T) {
 	ts := newTestServer(t, &fakeVerifier{owner: "org1", sub: "u1"})
 	defer ts.Close()
 
-	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/collab/org1:ws1:doc1?token=x"
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	a, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-		Subprotocols: []string{"yjs"},
-	})
-	if err != nil {
-		t.Fatalf("dial a: %v", err)
-	}
+	a := dial(t, ctx, ts, "org1:ws1:doc1")
 	defer a.Close(websocket.StatusNormalClosure, "")
-
-	b, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-		Subprotocols: []string{"yjs"},
-	})
-	if err != nil {
-		t.Fatalf("dial b: %v", err)
-	}
+	b := dial(t, ctx, ts, "org1:ws1:doc1")
 	defer b.Close(websocket.StatusNormalClosure, "")
 
 	// Give the room registry a tick to register b.
@@ -151,42 +172,74 @@ func TestWSRelayBetweenPeers(t *testing.T) {
 	}
 }
 
-func TestWSReplaysPersistedState(t *testing.T) {
+// A peer joining later receives every stored update as its own message, in
+// order, since y-websocket decodes one message per WebSocket frame.
+func TestWSReplaysEachFrame(t *testing.T) {
 	ts := newTestServer(t, &fakeVerifier{owner: "org1", sub: "u1"})
 	defer ts.Close()
-
-	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/collab/org1:ws1:doc-replay?token=x"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// First peer sends an update, then disconnects.
-	a, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: []string{"yjs"}})
-	if err != nil {
-		t.Fatalf("dial a: %v", err)
+	sent := [][]byte{{0, 2, 0xaa}, {0, 2, 0xbb, 0xcc}}
+	a := dial(t, ctx, ts, "org1:ws1:doc-replay")
+	for _, f := range sent {
+		if err := a.Write(ctx, websocket.MessageBinary, f); err != nil {
+			t.Fatalf("write: %v", err)
+		}
 	}
-	payload := []byte{0xaa, 0xbb}
-	if err := a.Write(ctx, websocket.MessageBinary, payload); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	// Give persistence a moment.
-	time.Sleep(150 * time.Millisecond)
 	_ = a.Close(websocket.StatusNormalClosure, "")
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
-	// Second peer joins fresh — should immediately receive persisted state.
-	b, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: []string{"yjs"}})
-	if err != nil {
-		t.Fatalf("dial b: %v", err)
-	}
+	b := dial(t, ctx, ts, "org1:ws1:doc-replay")
 	defer b.Close(websocket.StatusNormalClosure, "")
-	readCtx, c := context.WithTimeout(ctx, 2*time.Second)
-	defer c()
-	_, got, err := b.Read(readCtx)
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	for i, want := range sent {
+		readCtx, c := context.WithTimeout(ctx, 2*time.Second)
+		_, got, err := b.Read(readCtx)
+		c()
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("replay %d: want %v got %v", i, want, got)
+		}
 	}
-	if string(got) != string(payload) {
-		t.Fatalf("replay mismatch: want %v got %v", payload, got)
+}
+
+// A connection that sends frames faster than the limit is closed with 1008.
+func TestWSRateLimitCloses(t *testing.T) {
+	ts := newTestServer(t, &fakeVerifier{owner: "org1", sub: "u1"})
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	a := dial(t, ctx, ts, "org1:ws1:doc-flood")
+	defer a.CloseNow()
+	for range frameBurst + 50 {
+		if err := a.Write(ctx, websocket.MessageBinary, []byte{1, 0}); err != nil {
+			break
+		}
+	}
+	_, _, err := a.Read(ctx)
+	if got := websocket.CloseStatus(err); got != websocket.StatusPolicyViolation {
+		t.Fatalf("close status %v (%v), want 1008", got, err)
+	}
+}
+
+// A frame past maxFrame closes the connection with 1009 before it is relayed.
+func TestWSOversizeFrameCloses(t *testing.T) {
+	ts := newTestServer(t, &fakeVerifier{owner: "org1", sub: "u1"})
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	a := dial(t, ctx, ts, "org1:ws1:doc-big")
+	defer a.CloseNow()
+	_ = a.Write(ctx, websocket.MessageBinary, make([]byte, maxFrame+1))
+	_, _, err := a.Read(ctx)
+	if got := websocket.CloseStatus(err); got != websocket.StatusMessageTooBig {
+		t.Fatalf("close status %v (%v), want 1009", got, err)
 	}
 }

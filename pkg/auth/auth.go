@@ -2,8 +2,8 @@
 //
 // We do NOT share code with team-go/extract because the WS upgrade
 // path needs to extract the token from either the Authorization header
-// or the ?token= query string (browsers cannot set headers on the WS
-// handshake), and we want a tiny self-contained dependency surface.
+// or the offered WebSocket subprotocols (browsers cannot set headers on
+// the WS handshake), and we want a tiny self-contained dependency surface.
 package auth
 
 import (
@@ -82,36 +82,53 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (*Claims, error) {
 	return claims, nil
 }
 
-// ExtractToken pulls a bearer token from the Authorization header or
-// the `token` query parameter. WS upgrades from browsers MUST use the
-// query string because the browser WS API forbids custom headers.
+// ExtractToken pulls a bearer token from the Authorization header or, for a
+// browser, whose WebSocket API cannot set headers, from a `bearer.<token>`
+// entry in the Sec-WebSocket-Protocol list it offers alongside `yjs`:
+//
+//	new WebSocket(url, ["yjs", "bearer." + token])
+//
+// A token is never read from the URL, because the edge writes query strings
+// to its access log.
 func ExtractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); h != "" {
 		if strings.HasPrefix(strings.ToLower(h), "bearer ") {
 			return strings.TrimSpace(h[7:])
 		}
 	}
-	return r.URL.Query().Get("token")
+	for _, v := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for p := range strings.SplitSeq(v, ",") {
+			if tok, ok := strings.CutPrefix(strings.TrimSpace(p), "bearer."); ok {
+				return tok
+			}
+		}
+	}
+	return ""
 }
 
+// lookupKey returns the key for kid, refreshing the JWKS when the cached set
+// is stale or lacks kid. A key the last good fetch published still verifies
+// when a refresh fails, so an IAM outage does not refuse the tokens IAM has
+// already vouched for; a successful refresh that drops a key revokes it.
 func (v *Verifier) lookupKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	v.mu.RLock()
-	if k, ok := v.keys[kid]; ok && time.Since(v.fetched) < v.ttl {
-		v.mu.RUnlock()
+	k, ok := v.keys[kid]
+	fresh := time.Since(v.fetched) < v.ttl
+	v.mu.RUnlock()
+	if ok && fresh {
 		return k, nil
 	}
-	v.mu.RUnlock()
 
-	if err := v.refresh(ctx); err != nil {
-		return nil, err
-	}
+	err := v.refresh(ctx)
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	k, ok := v.keys[kid]
-	if !ok {
-		return nil, fmt.Errorf("kid %q not found", kid)
+	if k, ok := v.keys[kid]; ok {
+		return k, nil
 	}
-	return k, nil
+	if err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("kid %q not found", kid)
 }
 
 type jwk struct {

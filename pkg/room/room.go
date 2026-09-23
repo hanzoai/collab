@@ -1,16 +1,17 @@
 // Package room is the in-memory registry of doc-keyed broadcast hubs.
 //
-// We use a dumb relay (no server-side Y.js parsing). Justification:
+// We use a dumb relay (no server-side Y.js merging). Justification:
 // y-websocket already converges client state via the sync + awareness
 // protocols; the server only needs to (a) fan out binary messages and
-// (b) persist them so a fresh peer can replay the state. Parsing CRDT
-// updates server-side would buy us nothing for single-region relay and
-// pulls in a non-trivial dep (peerdb-io/y-go). Revisit only when we
-// need cross-region merge.
+// (b) persist the ones that carry document content so a fresh peer can
+// replay the state. Merging CRDT updates server-side would buy us nothing
+// for single-region relay and pulls in a non-trivial dep (peerdb-io/y-go).
+// Revisit only when we need cross-region merge.
 package room
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/hanzoai/collab/pkg/metrics"
@@ -24,7 +25,7 @@ type Peer struct {
 }
 
 // Room fans out binary messages between Peers of the same docID and
-// persists every update to the backing Store.
+// persists the ones that carry document content to the backing Store.
 type Room struct {
 	DocID string
 	store store.Store
@@ -48,14 +49,14 @@ func NewRegistry(s store.Store) *Registry {
 }
 
 // Join attaches peer to docID's Room (creating it if needed) and
-// returns the loaded persisted state to replay to the new peer.
+// returns the persisted frames to replay to the new peer, in order.
 //
 // The state is loaded before the registry is touched, so a failed Load
 // leaves no Room behind. The Room is then found or created and the peer
 // added under one r.mu hold, the same lock Leave takes to remove an empty
 // Room, so a joiner can never enter a Room that Leave has just removed.
-func (r *Registry) Join(ctx context.Context, docID string, peer *Peer) (*Room, []byte, error) {
-	state, err := r.store.Load(ctx, docID)
+func (r *Registry) Join(ctx context.Context, docID string, peer *Peer) (*Room, [][]byte, error) {
+	frames, err := r.store.Load(ctx, docID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -72,7 +73,7 @@ func (r *Registry) Join(ctx context.Context, docID string, peer *Peer) (*Room, [
 	rm.peers[peer] = struct{}{}
 	rm.mu.Unlock()
 	metrics.Peers.Inc()
-	return rm, state, nil
+	return rm, frames, nil
 }
 
 // Leave detaches peer; when the last peer leaves the Room is removed.
@@ -95,9 +96,10 @@ func (r *Registry) Leave(docID string, peer *Peer) {
 	metrics.Peers.Dec()
 }
 
-// Broadcast relays msg to all peers in the room EXCEPT the sender,
-// and appends the update to the persistent store. Persistence runs in
-// a goroutine so the broadcast hot path is non-blocking on storage.
+// Broadcast relays msg to all peers in the room EXCEPT the sender, then
+// persists it if it carries document content. The append runs in the
+// caller's goroutine, so a connection reads its next frame only after this
+// one is stored: each connection has at most one append in flight.
 func (rm *Room) Broadcast(ctx context.Context, sender *Peer, msg []byte) {
 	rm.mu.Lock()
 	targets := make([]*Peer, 0, len(rm.peers))
@@ -118,11 +120,25 @@ func (rm *Room) Broadcast(ctx context.Context, sender *Peer, msg []byte) {
 		}
 	}
 
-	go func() {
-		if err := rm.store.Append(ctx, rm.DocID, msg); err != nil {
-			metrics.Errors.WithLabelValues("store_append").Inc()
-		}
-	}()
+	if !content(msg) {
+		return
+	}
+	switch err := rm.store.Append(ctx, rm.DocID, msg); {
+	case err == nil:
+	case errors.Is(err, store.ErrFull):
+		metrics.Errors.WithLabelValues("store_full").Inc()
+	default:
+		metrics.Errors.WithLabelValues("store_append").Inc()
+	}
+}
+
+// content reports whether msg is a y-websocket sync message that carries
+// document content: messageSync (0) followed by syncStep2 (1) or syncUpdate
+// (2). Sync step 1 (a state vector) and awareness (presence, sent on every
+// cursor move) are relayed but not stored, since replaying them to a later
+// peer replays nothing of the document.
+func content(msg []byte) bool {
+	return len(msg) >= 2 && msg[0] == 0 && (msg[1] == 1 || msg[1] == 2)
 }
 
 // PeerCount returns the current number of peers in this room.

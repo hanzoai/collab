@@ -1,8 +1,8 @@
 // Command collab is the Hanzo realtime collaboration relay.
 //
 // It accepts Y.js sync messages over WebSocket at /v1/collab/<doc_id>
-// and relays them between peers in the same room, persisting updates
-// to a pluggable store. It replaces Huly's collaborator Node service.
+// and relays them between peers in the same room, persisting document
+// updates to SQLite. It replaces Huly's collaborator Node service.
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -82,23 +82,19 @@ func run() error {
 	return httpSrv.Shutdown(shutCtx)
 }
 
+// maxDoc caps one document's stored frames; a frame that would pass it is
+// relayed but not stored.
+const maxDoc = 16 << 20
+
+// newStore opens the SQLite store at COLLAB_SQLITE_PATH. COLLAB_STORE_BYTES
+// caps the database file (default 64 MiB); the files on disk never exceed
+// twice that, so size the volume from it.
 func newStore() (store.Store, error) {
-	backend := strings.ToLower(envOr("COLLAB_STORAGE", "sqlite"))
-	switch backend {
-	case "sqlite":
-		path := envOr("COLLAB_SQLITE_PATH", "collab.db")
-		return store.NewSQLite(path)
-	case "s3":
-		return store.NewS3(context.Background(), store.S3Config{
-			Endpoint:  os.Getenv("S3_ENDPOINT"),
-			Region:    os.Getenv("S3_REGION"),
-			Bucket:    os.Getenv("S3_BUCKET"),
-			AccessKey: os.Getenv("S3_ACCESS_KEY"),
-			SecretKey: os.Getenv("S3_SECRET_KEY"),
-		})
-	default:
-		return nil, fmt.Errorf("unknown COLLAB_STORAGE=%q", backend)
+	maxFile, err := strconv.ParseInt(envOr("COLLAB_STORE_BYTES", "67108864"), 10, 64)
+	if err != nil || maxFile <= 0 {
+		return nil, fmt.Errorf("COLLAB_STORE_BYTES must be a positive byte count")
 	}
+	return store.NewSQLite(envOr("COLLAB_SQLITE_PATH", "collab.db"), maxDoc, maxFile)
 }
 
 func envOr(k, def string) string {

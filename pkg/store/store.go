@@ -1,22 +1,27 @@
 // Package store persists Y.js document state.
 //
-// We treat doc state as an opaque blob of CRDT updates. Updates are
-// appended; load returns the concatenation. Periodic compaction is the
-// adapter's job (in S3 we coalesce on a watermark; in SQLite the row is
-// the canonical state and writes overwrite).
+// A document is the ordered list of the frames that carried its content. A
+// frame is appended as it arrives and never rewritten, so an append costs the
+// size of the frame, not the size of the document. Load returns the frames in
+// order, and the server replays each as its own WebSocket message.
 package store
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
-// Store is the persistence boundary.
-//
-// One way: every adapter MUST be safe for concurrent calls on the same
-// docID; the server treats Append + Load as the only operations.
+// ErrFull is returned by Append when the frame would take its document past
+// the store's per-document cap.
+var ErrFull = errors.New("store: document full")
+
+// Store is the persistence boundary. Implementations are safe for concurrent
+// use.
 type Store interface {
-	// Append persists a Y.js update for docID.
-	Append(ctx context.Context, docID string, update []byte) error
-	// Load returns the merged document state, or nil if the doc is new.
-	Load(ctx context.Context, docID string) ([]byte, error)
+	// Append persists one frame for docID, after every frame appended before it.
+	Append(ctx context.Context, docID string, frame []byte) error
+	// Load returns docID's frames in append order, or none if the doc is new.
+	Load(ctx context.Context, docID string) ([][]byte, error)
 	// Close releases adapter resources.
 	Close() error
 }

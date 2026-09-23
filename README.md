@@ -6,7 +6,7 @@ Hanzo realtime collaboration relay. Replaces Huly's `collaborator`
 Node service with a single static Go binary.
 
 ```
-clients (Y.js) ──WS──> collab ──Append──> Store (sqlite | s3)
+clients (Y.js) ──WS──> collab ──Append──> SQLite
                   └─ fan-out to peers in the same room
 ```
 
@@ -23,47 +23,59 @@ clients (Y.js) ──WS──> collab ──Append──> Store (sqlite | s3)
 
 ### Auth
 
-Bearer JWT in `Authorization: Bearer <token>` OR `?token=<token>`
-(browsers cannot set headers on the WS handshake — secure ONLY over
-TLS). Tokens are verified against the IAM JWKS at `IAM_JWKS_URL`
-(default `https://hanzo.id/v1/iam/.well-known/jwks`).
+Bearer JWT in `Authorization: Bearer <token>`, or, from a browser (whose
+WebSocket API cannot set headers), as a `bearer.<token>` entry in the
+subprotocol list beside `yjs`:
+
+```js
+new WebSocket(url, ["yjs", "bearer." + token])
+```
+
+A `?token=` query parameter is not read: the edge writes query strings to
+its access log. Tokens are verified against the IAM JWKS at `IAM_JWKS_URL`
+(default `https://hanzo.id/v1/iam/.well-known/jwks`); when a refresh fails,
+the keys of the last good fetch keep verifying.
 
 ## Sync protocol
 
-The server is a dumb relay — it does NOT parse Y.js update payloads.
-Justification: y-websocket clients converge via the standard Y.js sync
-and awareness protocols; concatenated CRDT updates remain a valid
-merged document state, so persistence is just append-only bytes. We
-revisit this only when cross-region merge or server-side validation is
-required.
+The server is a dumb relay — it does NOT merge Y.js updates. Every
+binary frame is relayed to the other peers in the room. A frame is
+stored when its y-websocket header says it carries document content
+(`messageSync` followed by `syncStep2` or `syncUpdate`); sync step 1 and
+awareness are relayed only. Applying the stored updates in order
+rebuilds the document, so persistence is append-only frames. We revisit
+this only when cross-region merge or server-side validation is required.
 
-On peer join the server immediately writes the loaded persisted state
-as one binary frame so the new client can replay history before
-processing live updates.
+On peer join the server writes each stored frame as its own binary
+message, in order, before relaying live updates.
+
+### Limits
+
+| Limit | Value | On breach |
+|-------|-------|-----------|
+| Frame size | 1 MiB | connection closed, 1009 |
+| Frame rate per connection | 50/s, burst 200 | connection closed, 1008 |
+| Stored bytes per document | 16 MiB | frame relayed, not stored (`store_full`) |
+| Database file | `COLLAB_STORE_BYTES` | frame relayed, not stored (`store_append`) |
+
+Each connection has at most one append in flight: it reads its next
+frame only after the last one is stored. The database runs a rollback
+journal, which holds only the pages one transaction changes, so the
+files on disk never exceed twice `COLLAB_STORE_BYTES`. Size the volume
+from that, not the other way round.
 
 ## Run
 
 ```
-go run ./cmd/collab                # COLLAB_STORAGE=sqlite (default)
-COLLAB_STORAGE=s3 \
-  S3_ENDPOINT=https://nyc3.digitaloceanspaces.com \
-  S3_REGION=nyc3 \
-  S3_BUCKET=hanzo-collab \
-  S3_ACCESS_KEY=... S3_SECRET_KEY=... \
-  go run ./cmd/collab
+go run ./cmd/collab
 ```
 
 | Env                  | Default                                  |
 |----------------------|------------------------------------------|
 | `COLLAB_ADDR`        | `:3078` (Huly drop-in port)              |
-| `COLLAB_STORAGE`     | `sqlite`                                 |
-| `COLLAB_SQLITE_PATH` | `collab.db`                              |
+| `COLLAB_SQLITE_PATH` | `collab.db` (a file path)                |
+| `COLLAB_STORE_BYTES` | `67108864` (64 MiB database file cap)    |
 | `IAM_JWKS_URL`       | `https://hanzo.id/v1/iam/.well-known/jwks`      |
-| `S3_ENDPOINT`        | (AWS default if unset)                   |
-| `S3_REGION`          | `us-east-1`                              |
-| `S3_BUCKET`          | required when `COLLAB_STORAGE=s3`        |
-| `S3_ACCESS_KEY`      | required when `COLLAB_STORAGE=s3`        |
-| `S3_SECRET_KEY`      | required when `COLLAB_STORAGE=s3`        |
 
 ## Build
 
@@ -86,8 +98,8 @@ Image: `ghcr.io/hanzoai/collab:<semver>`. Pin a `vX.Y.Z` or
 Port 3078 is exposed (matches Huly's legacy `collaborator` port for
 drop-in WS path replacement).
 
-K8s manifest lives in `universe/infra/k8s/collab/`. Storage in prod is
-S3 (DO Spaces). Local/dev is SQLite at `collab.db`.
+Declared in universe as `charts/app/values/collab/collab.yaml`, with
+SQLite on one ReadWriteOnce volume, one replica, Recreate.
 
 ## Layout
 
@@ -97,7 +109,7 @@ S3 (DO Spaces). Local/dev is SQLite at `collab.db`.
 ├── pkg/auth/                 # IAM JWKS verifier
 ├── pkg/server/               # HTTP + WS handlers
 ├── pkg/room/                 # in-memory broadcast registry
-├── pkg/store/                # Store interface + sqlite + s3
+├── pkg/store/                # Store interface + sqlite
 └── pkg/metrics/              # Prometheus registry
 ```
 

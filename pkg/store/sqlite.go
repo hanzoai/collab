@@ -5,69 +5,107 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 
-	_ "github.com/hanzoai/sqlite"
+	"github.com/hanzoai/sqlite"
 )
 
-// SQLite stores each doc as a single row. We do not split updates into
-// rows because for dev/local the doc is small and Load is the hot path.
+// pageSize is the page size a new database is created with; maxFile is
+// converted to max_page_count in these units.
+const pageSize = 4096
+
+// SQLite keeps one row per document in doc, carrying the document's size, and
+// one row per frame in frame. It uses a single connection, so appends never
+// contend for the write lock: callers queue on the pool, each holding only the
+// frame it is persisting.
+//
+// Two bounds hold. Append refuses a frame that would take its document past
+// maxDoc bytes. max_page_count holds the database file to maxFile bytes, which
+// SQLite enforces on every write with SQLITE_FULL; the rollback journal holds
+// only the pages one transaction changes, so the files on disk never exceed
+// twice maxFile.
 type SQLite struct {
-	db *sql.DB
+	db     *sql.DB
+	maxDoc int64
 }
 
-// NewSQLite opens (and migrates) a SQLite DB at path.
-func NewSQLite(path string) (*SQLite, error) {
-	db, err := sql.Open("sqlite", path)
+// NewSQLite opens (and migrates) the SQLite database at path, capping each
+// document at maxDoc bytes of frames and the database file at maxFile bytes.
+// The pragmas are applied to every connection on either driver backend.
+func NewSQLite(path string, maxDoc, maxFile int64) (*SQLite, error) {
+	db, err := sqlite.OpenPragma("file:"+path, []sqlite.Pragma{
+		{Name: "busy_timeout", Value: "5000"},
+		{Name: "page_size", Value: strconv.Itoa(pageSize)},
+		{Name: "journal_mode", Value: "DELETE"},
+		{Name: "max_page_count", Value: strconv.FormatInt(maxFile/pageSize, 10)},
+	})
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.ExecContext(context.Background(), `
-		CREATE TABLE IF NOT EXISTS docs (
-			doc_id TEXT PRIMARY KEY,
-			state  BLOB NOT NULL
-		)`); err != nil {
+		CREATE TABLE IF NOT EXISTS doc (
+			id   TEXT PRIMARY KEY,
+			size INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS frame (
+			seq  INTEGER PRIMARY KEY,
+			doc  TEXT NOT NULL,
+			data BLOB NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS frame_doc ON frame(doc, seq)`); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("create table: %w", err)
+		return nil, fmt.Errorf("create tables: %w", err)
 	}
-	return &SQLite{db: db}, nil
+	return &SQLite{db: db, maxDoc: maxDoc}, nil
 }
 
-// Append concatenates the update onto the existing state. Y.js update
-// merging is associative + commutative, so concatenation is a valid
-// representation of the merged document (client merges on load).
-func (s *SQLite) Append(ctx context.Context, docID string, update []byte) error {
+// Append inserts frame after docID's existing frames and adds its length to
+// the document's size, in one transaction. It returns ErrFull, and writes
+// nothing, when the frame would take the document past maxDoc.
+func (s *SQLite) Append(ctx context.Context, docID string, frame []byte) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	var existing []byte
-	row := tx.QueryRowContext(ctx, `SELECT state FROM docs WHERE doc_id = ?`, docID)
-	if err := row.Scan(&existing); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var size int64
+	err = tx.QueryRowContext(ctx, `SELECT size FROM doc WHERE id = ?`, docID).Scan(&size)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	merged := append(existing, update...)
+	if size+int64(len(frame)) > s.maxDoc {
+		return ErrFull
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO frame(doc, data) VALUES(?, ?)`, docID, frame); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO docs(doc_id, state) VALUES(?, ?)
-		ON CONFLICT(doc_id) DO UPDATE SET state = excluded.state`,
-		docID, merged); err != nil {
+		INSERT INTO doc(id, size) VALUES(?, ?)
+		ON CONFLICT(id) DO UPDATE SET size = size + excluded.size`,
+		docID, len(frame)); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// Load returns the merged state or nil if absent.
-func (s *SQLite) Load(ctx context.Context, docID string) ([]byte, error) {
-	var state []byte
-	row := s.db.QueryRowContext(ctx, `SELECT state FROM docs WHERE doc_id = ?`, docID)
-	if err := row.Scan(&state); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
+// Load returns docID's frames in append order, or nil if it has none.
+func (s *SQLite) Load(ctx context.Context, docID string) ([][]byte, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT data FROM frame WHERE doc = ? ORDER BY seq`, docID)
+	if err != nil {
 		return nil, err
 	}
-	return state, nil
+	defer rows.Close()
+	var frames [][]byte
+	for rows.Next() {
+		var f []byte
+		if err := rows.Scan(&f); err != nil {
+			return nil, err
+		}
+		frames = append(frames, f)
+	}
+	return frames, rows.Err()
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }

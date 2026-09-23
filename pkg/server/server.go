@@ -115,12 +115,25 @@ func parseDocID(docID string) (org, workspace, doc string, err error) {
 	return parts[0], parts[1], parts[2], nil
 }
 
+// Per-connection limits. A frame larger than maxFrame closes the connection
+// (1009); more than frameRate frames a second, beyond a burst of frameBurst,
+// closes it with 1008. persistTimeout bounds one frame's append, which outlives
+// the connection so a peer's last frame is stored even as it disconnects.
+const (
+	maxFrame       = 1 << 20
+	frameRate      = 50
+	frameBurst     = 200
+	persistTimeout = 10 * time.Second
+)
+
 func (s *Server) serveWS(parent context.Context, conn *websocket.Conn, docID, peerID string) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
+	conn.SetReadLimit(maxFrame)
+
 	peer := &room.Peer{ID: peerID, Send: make(chan []byte, 64)}
-	rm, state, err := s.registry.Join(ctx, docID, peer)
+	rm, frames, err := s.registry.Join(ctx, docID, peer)
 	if err != nil {
 		metrics.Errors.WithLabelValues("join").Inc()
 		conn.Close(websocket.StatusInternalError, "join failed")
@@ -128,9 +141,10 @@ func (s *Server) serveWS(parent context.Context, conn *websocket.Conn, docID, pe
 	}
 	defer s.registry.Leave(docID, peer)
 
-	// Replay persisted state to the new peer so they converge.
-	if len(state) > 0 {
-		if err := conn.Write(ctx, websocket.MessageBinary, state); err != nil {
+	// Replay persisted frames to the new peer, one message per frame, so a
+	// y-websocket client decodes each of them.
+	for _, f := range frames {
+		if err := conn.Write(ctx, websocket.MessageBinary, f); err != nil {
 			return
 		}
 		metrics.Messages.WithLabelValues("out").Inc()
@@ -159,19 +173,46 @@ func (s *Server) serveWS(parent context.Context, conn *websocket.Conn, docID, pe
 		}
 	}()
 
-	// Reader: forward inbound binary frames to the room.
+	// Reader: forward inbound binary frames to the room, one at a time.
+	limit := bucket{tokens: frameBurst, last: time.Now()}
 	for {
 		typ, data, err := conn.Read(ctx)
 		if err != nil {
+			break
+		}
+		if !limit.take(time.Now()) {
+			metrics.Errors.WithLabelValues("rate_limited").Inc()
+			conn.Close(websocket.StatusPolicyViolation, "rate limit")
 			break
 		}
 		if typ != websocket.MessageBinary {
 			continue
 		}
 		metrics.Messages.WithLabelValues("in").Inc()
-		rm.Broadcast(ctx, peer, data)
+		pctx, c := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+		rm.Broadcast(pctx, peer, data)
+		c()
 	}
 
 	cancel()
 	<-writerDone
+}
+
+// bucket is a token bucket refilled at frameRate tokens a second up to
+// frameBurst. One connection's reader owns it, so it needs no lock.
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// take spends one token, refilling first for the time since the last call. It
+// reports false, spending nothing, when the bucket is empty.
+func (b *bucket) take(now time.Time) bool {
+	b.tokens = min(frameBurst, b.tokens+now.Sub(b.last).Seconds()*frameRate)
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }

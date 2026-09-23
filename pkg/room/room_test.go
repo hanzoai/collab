@@ -16,40 +16,46 @@ func init() { metrics.Register(nil) }
 // memStore is an in-memory Store for tests.
 type memStore struct {
 	mu   sync.Mutex
-	data map[string][]byte
+	data map[string][][]byte
 }
 
-func newMem() *memStore { return &memStore{data: map[string][]byte{}} }
+func newMem() *memStore { return &memStore{data: map[string][][]byte{}} }
 
 func (m *memStore) Append(_ context.Context, id string, b []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.data[id] = append(m.data[id], b...)
+	m.data[id] = append(m.data[id], append([]byte(nil), b...))
 	return nil
 }
-func (m *memStore) Load(_ context.Context, id string) ([]byte, error) {
+func (m *memStore) Load(_ context.Context, id string) ([][]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if v, ok := m.data[id]; ok {
-		return append([]byte(nil), v...), nil
-	}
-	return nil, nil
+	return append([][]byte(nil), m.data[id]...), nil
 }
 func (m *memStore) Close() error { return nil }
 
+// y-websocket frames: messageSync then syncStep1/syncStep2/syncUpdate, and
+// messageAwareness.
+var (
+	step1     = []byte{0, 0, 1}
+	step2     = []byte{0, 1, 2}
+	update    = []byte{0, 2, 3}
+	awareness = []byte{1, 4}
+)
+
 func TestRegistryJoinLeave(t *testing.T) {
 	ms := newMem()
-	_ = ms.Append(context.Background(), "doc", []byte("hello"))
+	_ = ms.Append(context.Background(), "doc", update)
 
 	r := NewRegistry(ms)
 
 	p1 := &Peer{ID: "a", Send: make(chan []byte, 4)}
-	rm, state, err := r.Join(context.Background(), "doc", p1)
+	rm, frames, err := r.Join(context.Background(), "doc", p1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(state) != "hello" {
-		t.Fatalf("state mismatch: %q", state)
+	if len(frames) != 1 || string(frames[0]) != string(update) {
+		t.Fatalf("frames mismatch: %v", frames)
 	}
 	if rm.PeerCount() != 1 {
 		t.Fatalf("want 1 peer, got %d", rm.PeerCount())
@@ -95,14 +101,13 @@ func TestRoomBroadcast(t *testing.T) {
 	_, _, _ = r.Join(context.Background(), "doc", p2)
 	_, _, _ = r.Join(context.Background(), "doc", p3)
 
-	msg := []byte("update")
-	rm.Broadcast(context.Background(), p1, msg)
+	rm.Broadcast(context.Background(), p1, update)
 
 	for _, p := range []*Peer{p2, p3} {
 		select {
 		case got := <-p.Send:
-			if string(got) != "update" {
-				t.Fatalf("peer %s got %q", p.ID, got)
+			if string(got) != string(update) {
+				t.Fatalf("peer %s got %v", p.ID, got)
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("peer %s never received", p.ID)
@@ -115,22 +120,38 @@ func TestRoomBroadcast(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Persistence happens asynchronously; allow a brief moment.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		got, _ := ms.Load(context.Background(), "doc")
-		if string(got) == "update" {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Broadcast returns after the append, so the frame is already stored.
+	if got, _ := ms.Load(context.Background(), "doc"); len(got) != 1 || string(got[0]) != string(update) {
+		t.Fatalf("stored %v, want the update", got)
 	}
-	t.Fatal("persistence never observed")
+}
+
+// Every frame is relayed; only the ones carrying document content are stored.
+func TestBroadcastStoresOnlyContent(t *testing.T) {
+	ms := newMem()
+	r := NewRegistry(ms)
+	a := &Peer{ID: "a", Send: make(chan []byte, 8)}
+	b := &Peer{ID: "b", Send: make(chan []byte, 8)}
+	rm, _, _ := r.Join(context.Background(), "doc", a)
+	_, _, _ = r.Join(context.Background(), "doc", b)
+
+	sent := [][]byte{step1, step2, awareness, update, {0}, {}}
+	for _, f := range sent {
+		rm.Broadcast(context.Background(), a, f)
+	}
+	if n := len(b.Send); n != len(sent) {
+		t.Fatalf("relayed %d of %d frames", n, len(sent))
+	}
+	got, _ := ms.Load(context.Background(), "doc")
+	if fmt.Sprint(got) != fmt.Sprint([][]byte{step2, update}) {
+		t.Fatalf("stored %v, want step2 and update only", got)
+	}
 }
 
 // failStore refuses every Load.
 type failStore struct{ memStore }
 
-func (*failStore) Load(context.Context, string) ([]byte, error) { return nil, errors.New("store down") }
+func (*failStore) Load(context.Context, string) ([][]byte, error) { return nil, errors.New("store down") }
 
 // A Join whose Load fails must leave the registry as it found it; otherwise
 // every failed join of a new doc id holds a Room forever.
@@ -156,7 +177,7 @@ type gatedStore struct {
 	release chan struct{}
 }
 
-func (g *gatedStore) Load(ctx context.Context, id string) ([]byte, error) {
+func (g *gatedStore) Load(ctx context.Context, id string) ([][]byte, error) {
 	g.loading <- struct{}{}
 	<-g.release
 	return g.memStore.Load(ctx, id)

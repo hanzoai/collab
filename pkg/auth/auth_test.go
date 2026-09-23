@@ -43,11 +43,30 @@ func TestExtractToken(t *testing.T) {
 			want: "foo",
 		},
 		{
-			name: "query param",
+			name: "subprotocol",
+			req: func() *http.Request {
+				r := httptest.NewRequest("GET", "/v1/collab/x", nil)
+				r.Header.Set("Sec-WebSocket-Protocol", "yjs, bearer.s1.s2.s3")
+				return r
+			},
+			want: "s1.s2.s3",
+		},
+		{
+			name: "subprotocol in a second header line",
+			req: func() *http.Request {
+				r := httptest.NewRequest("GET", "/v1/collab/x", nil)
+				r.Header.Add("Sec-WebSocket-Protocol", "yjs")
+				r.Header.Add("Sec-WebSocket-Protocol", "bearer.s1")
+				return r
+			},
+			want: "s1",
+		},
+		{
+			name: "query param is never read",
 			req: func() *http.Request {
 				return httptest.NewRequest("GET", "/v1/collab/x?token=q1.q2.q3", nil)
 			},
-			want: "q1.q2.q3",
+			want: "",
 		},
 		{
 			name: "none",
@@ -57,9 +76,10 @@ func TestExtractToken(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "header beats query",
+			name: "header beats subprotocol",
 			req: func() *http.Request {
-				r := httptest.NewRequest("GET", "/v1/collab/x?token=q", nil)
+				r := httptest.NewRequest("GET", "/v1/collab/x", nil)
+				r.Header.Set("Sec-WebSocket-Protocol", "yjs, bearer.p")
 				r.Header.Set("Authorization", "Bearer h")
 				return r
 			},
@@ -148,14 +168,15 @@ func TestUnknownKidRefetchesAfterWindow(t *testing.T) {
 	}
 	srv, fetches := jwksServer(t, "good", &key.PublicKey)
 	v := New(srv.URL)
-	v.minRefresh = 50 * time.Millisecond
+	v.minRefresh = 500 * time.Millisecond
 
 	if _, err := v.Verify(context.Background(), sign(t, key, "new")); err == nil {
 		t.Fatal("token with unknown kid accepted")
 	}
-	time.Sleep(60 * time.Millisecond)
+	tok := sign(t, key, "new")
+	time.Sleep(600 * time.Millisecond)
 	for range 5 {
-		_, _ = v.Verify(context.Background(), sign(t, key, "new"))
+		_, _ = v.Verify(context.Background(), tok)
 	}
 	if n := fetches.Load(); n != 2 {
 		t.Fatalf("JWKS fetched %d times, want 2", n)
@@ -179,5 +200,39 @@ func TestCancelledCallerDoesNotPoisonWindow(t *testing.T) {
 	}
 	if _, err := v.Verify(context.Background(), sign(t, key, "good")); err != nil {
 		t.Fatalf("valid token refused after a cancelled caller: %v", err)
+	}
+}
+
+// Once the cached set is stale, a refresh that fails still lets the keys the
+// last good fetch published verify; a kid it never published stays refused.
+func TestFailedRefreshKeepsCachedKeys(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, _ := jwksServer(t, "good", &key.PublicKey)
+	var down atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "iam down", http.StatusBadGateway)
+			return
+		}
+		good.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	v := New(srv.URL)
+	v.ttl = time.Millisecond
+	v.minRefresh = 0
+
+	if _, err := v.Verify(context.Background(), sign(t, key, "good")); err != nil {
+		t.Fatalf("valid token refused: %v", err)
+	}
+	down.Store(true)
+	time.Sleep(5 * time.Millisecond)
+	if _, err := v.Verify(context.Background(), sign(t, key, "good")); err != nil {
+		t.Fatalf("valid token refused while IAM is down: %v", err)
+	}
+	if _, err := v.Verify(context.Background(), sign(t, key, "forged")); err == nil {
+		t.Fatal("unknown kid accepted while IAM is down")
 	}
 }
