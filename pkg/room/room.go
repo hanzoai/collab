@@ -14,6 +14,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/hanzoai/collab/pkg/frame"
 	"github.com/hanzoai/collab/pkg/metrics"
 	"github.com/hanzoai/collab/pkg/store"
 )
@@ -120,7 +121,10 @@ func (rm *Room) Broadcast(ctx context.Context, sender *Peer, msg []byte) {
 		}
 	}
 
-	if !content(msg) {
+	// Sync step 1 and awareness (sent on every cursor move) are relayed but
+	// not stored: replaying them to a later peer replays nothing of the
+	// document.
+	if !frame.Content(msg) {
 		return
 	}
 	switch err := rm.store.Append(ctx, rm.DocID, msg); {
@@ -130,15 +134,6 @@ func (rm *Room) Broadcast(ctx context.Context, sender *Peer, msg []byte) {
 	default:
 		metrics.Errors.WithLabelValues("store_append").Inc()
 	}
-}
-
-// content reports whether msg is a y-websocket sync message that carries
-// document content: messageSync (0) followed by syncStep2 (1) or syncUpdate
-// (2). Sync step 1 (a state vector) and awareness (presence, sent on every
-// cursor move) are relayed but not stored, since replaying them to a later
-// peer replays nothing of the document.
-func content(msg []byte) bool {
-	return len(msg) >= 2 && msg[0] == 0 && (msg[1] == 1 || msg[1] == 2)
 }
 
 // PeerCount returns the current number of peers in this room.

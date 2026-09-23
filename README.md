@@ -64,6 +64,22 @@ journal, which holds only the pages one transaction changes, so the
 files on disk never exceed twice `COLLAB_STORE_BYTES`. Size the volume
 from that, not the other way round.
 
+### Upgrading from 0.1.x
+
+0.1.x kept each document as one row of `docs`, every message it received
+concatenated. On open, collab moves those rows into the frame tables in
+one transaction and drops `docs`: a state that splits into y-websocket
+messages keeps its content messages as frames, in order; one that does
+not is kept whole as one frame. If the frames do not fit under
+`COLLAB_STORE_BYTES`, the transaction rolls back, `docs` is left as it
+was, and collab exits with `migrate 0.1 docs`; raise the cap and start
+again.
+
+0.1.x took `COLLAB_SQLITE_PATH` as a driver DSN (`file:...?_pragma=...`).
+Now it is a file path and the pragmas are collab's own, so a deployment
+moving off 0.1.x sets the path in the same change as the image. A
+`file:` URI is refused at startup, by name.
+
 ## Run
 
 ```
@@ -73,7 +89,7 @@ go run ./cmd/collab
 | Env                  | Default                                  |
 |----------------------|------------------------------------------|
 | `COLLAB_ADDR`        | `:3078` (Huly drop-in port)              |
-| `COLLAB_SQLITE_PATH` | `collab.db` (a file path)                |
+| `COLLAB_SQLITE_PATH` | `collab.db` (a file path; a `file:` URI is refused) |
 | `COLLAB_STORE_BYTES` | `67108864` (64 MiB database file cap)    |
 | `IAM_JWKS_URL`       | `https://hanzo.id/v1/iam/.well-known/jwks`      |
 
@@ -109,7 +125,8 @@ SQLite on one ReadWriteOnce volume, one replica, Recreate.
 ├── pkg/auth/                 # IAM JWKS verifier
 ├── pkg/server/               # HTTP + WS handlers
 ├── pkg/room/                 # in-memory broadcast registry
-├── pkg/store/                # Store interface + sqlite
+├── pkg/frame/                # y-websocket message framing
+├── pkg/store/                # Store interface + sqlite, 0.1.x migration
 └── pkg/metrics/              # Prometheus registry
 ```
 
